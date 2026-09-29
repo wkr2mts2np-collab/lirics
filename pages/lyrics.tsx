@@ -19,11 +19,15 @@ export default function Lyrics() {
 
   return (
     <>
-      <button className={styles.back} onClick={() => router.push("/")}>
+      <button
+        className={styles.back}
+        onClick={() => router.push("/")}
+        aria-label="Go back"
+      >
         <svg
           stroke="currentColor"
           fill="currentColor"
-          stroke-width="0"
+          strokeWidth="0"
           viewBox="0 0 512 512"
           height="20px"
           width="20px"
@@ -32,23 +36,25 @@ export default function Lyrics() {
           <path d="M217.9 256L345 129c9.4-9.4 9.4-24.6 0-33.9-9.4-9.4-24.6-9.3-34 0L167 239c-9.1 9.1-9.3 23.7-.7 33.1L310.9 417c4.7 4.7 10.9 7 17 7s12.3-2.3 17-7c9.4-9.4 9.4-24.6 0-33.9L217.9 256z"></path>
         </svg>
       </button>
-      {song && song?.image && (
+
+      {song?.image && (
         <div className="frame-bg">
           <img
             className="bg-color album-artwork"
-            src={song?.image}
+            src={song.image}
             alt="music cover"
           />
           <img
             className="bg-black album-artwork"
-            src={song?.image}
+            src={song.image}
             alt="music cover"
           />
         </div>
       )}
+
       <main className={styles.container}>
         {session && status === "authenticated" ? (
-          song && song.name ? (
+          song?.name ? (
             <div className={styles.lirics}>
               <div
                 className={styles.fullContainer}
@@ -67,25 +73,23 @@ export default function Lyrics() {
                     maxWidth: "900px",
                   }}
                 >
-                  {lyric && lyric.synced ? (
-                    lyric.lyrics.map((a, i) => (
-                      <>
-                        <p
-                          key={i}
-                          data-seconds={a.seconds}
-                          className={`lyric ${
-                            karoke && karoke.index === i
-                              ? "current"
-                              : karoke && karoke.index > i
-                              ? "freeze"
-                              : ""
-                          }`}
-                        >
-                          {parseLyrics(a.lyrics)}
-                        </p>
-                      </>
+                  {lyric?.synced && Array.isArray(lyric.lyrics) ? (
+                    lyric.lyrics.map((a: any, i: number) => (
+                      <p
+                        key={i}
+                        data-seconds={a.seconds}
+                        className={`lyric ${
+                          karoke?.index === i
+                            ? "current"
+                            : karoke && karoke.index > i
+                            ? "freeze"
+                            : ""
+                        }`}
+                      >
+                        {parseLyrics(a.lyrics)}
+                      </p>
                     ))
-                  ) : lyric && lyric?.lyrics?.length > 0 ? (
+                  ) : lyric?.lyrics?.length ? (
                     <p className="current lyric">{lyric.lyrics}</p>
                   ) : (
                     <p className="cooking">We are cookin it.</p>
@@ -109,27 +113,29 @@ export const parseLyrics = (text: string) => {
   const parts = text.split(/(\([^)]+\))/g);
 
   const joined = parts.join("");
-  if (joined.startsWith("(") && joined.endsWith(")"))
+  if (joined.startsWith("(") && joined.endsWith(")")) {
     return (
       <span id="right" className={styles.hail}>
         {parts}
       </span>
     );
+  }
+
   return parts.map((part, index) => {
     if (part.startsWith("(") && part.endsWith(")")) {
-      if (index == parts.length - 2 && parts[parts.length - 1] == "")
+      if (index === parts.length - 2 && parts[parts.length - 1] === "") {
         return (
           <span key={index} id="right" className={styles.hail}>
             {part}
           </span>
         );
+      }
       return (
         <span key={index} className={styles.hail}>
           {part}
         </span>
       );
-    } else {
-      return <Fragment key={index}>{part}</Fragment>;
     }
+    return <Fragment key={index}>{part}</Fragment>;
   });
 };
