@@ -18,7 +18,8 @@
     "react-dom": "^18",
     "react-screen-wake-lock": "^3.0.2",
     "concurrently": "^8.2.2",
-    "spotify-web-api-node": "^5.0.2"
+    "spotify-web-api-node": "^5.0.2",
+    "genius-lyrics-api": "^1.1.0"
   },
   "devDependencies": {
     "typescript": "^5",
