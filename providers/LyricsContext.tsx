@@ -33,19 +33,21 @@ export function LyricsProvider({ children }: { children: ReactNode }) {
 
   useInterval(() => {
     if (lyric && lyric.synced) {
-      const cur = lyric.lyrics.filter(
-        (a) => currentTime >= a.seconds && currentTime <= a.seconds + 1
-      ).splice(-1)[0]
+      const cur = lyric.lyrics
+        .filter(
+          (a) => currentTime >= a.seconds && currentTime <= a.seconds + 1
+        )
+        .splice(-1)[0];
 
       if (cur && cur.lyrics != null) {
         const [ext, clean] = extractAndRemoveParentheses(
-          cur.lyrics == "" ? "..." : cur.lyrics
+          cur.lyrics === "" ? "..." : cur.lyrics
         );
         setCurrent({
           index: lyric.lyrics.findIndex((a) => a.seconds === cur.seconds),
           lyric: { seconds: cur.seconds, lyrics: clean.toString() },
         });
-      } else if(currentTime < 5) {
+      } else if (currentTime < 5) {
         setCurrent(null);
       }
     }
@@ -54,18 +56,37 @@ export function LyricsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (song && song.name && song.artist && prevSong !== song.name) {
       setCurrent(null);
-      fetch(
-        `/api/lyrics?track=${song.name.split(",").join("")}&artist=${
-          song.artist
-        }&album=${song.album}&artist=${song.artist}`
-      )
+
+      const title = encodeURIComponent(song.name);
+      const artist = encodeURIComponent(song.artist);
+
+      // Pass both title and track so backend route matches cleanly
+      fetch(`/api/lyrics?title=${title}&track=${title}&artist=${artist}`)
         .then((res) => res.json())
-        .then((d: SyncedLyrics | PlainLyrics) => {
-          setLyric(d);
-          setPrevSong(d.song);
+        .then((d) => {
+          if (!d || d.error) {
+            setLyric(null);
+            return;
+          }
+
+          // Format plain-text fallback response from Genius or plain LRCLIB
+          if (typeof d.lyrics === "string") {
+            setLyric({
+              synced: false,
+              lyrics: d.lyrics,
+              song: song.name,
+            } as PlainLyrics);
+          } else {
+            setLyric({
+              ...d,
+              song: d.song || song.name,
+            });
+          }
+          setPrevSong(song.name);
         })
-        .catch((a) => {
-          console.warn(a);
+        .catch((err) => {
+          console.warn("Failed to fetch lyrics:", err);
+          setLyric(null);
         });
     }
   }, [song, prevSong]);
