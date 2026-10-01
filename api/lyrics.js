@@ -6,13 +6,19 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing artist or title' });
   }
 
-  // 1. Clean primary artist (handles duets like "Yaakov Shwekey; Eliad")
+  // 1. Clean primary artist and extract Last Name for fallbacks
   const mainArtist = artist.split(';')[0].split(',')[0].trim();
+  const artistParts = mainArtist.split(' ');
+  const artistLastName = artistParts.length > 1 ? artistParts[artistParts.length - 1] : mainArtist;
 
-  // 2. Clean track title (strips remix tags, live tags, and brackets)
+  // 2. Aggressively clean track title (removes live, cover, acoustic, ft., feat.)
   const cleanedTitle = rawTitle
     .replace(/\(live.*?\)/gi, '')
+    .replace(/\(acoustic.*?\)/gi, '')
+    .replace(/\(cover.*?\)/gi, '')
     .replace(/\[.*?\]/g, '')
+    .replace(/feat\..*$/gi, '')
+    .replace(/ft\..*$/gi, '')
     .trim();
 
   // 3. Separate Hebrew script and English/Transliterated parts
@@ -20,24 +26,36 @@ export default async function handler(req, res) {
   const hebrewParts = titleParts.filter(p => /[\u0590-\u05FF]/.test(p));
   const englishParts = titleParts.filter(p => !/[\u0590-\u05FF]/.test(p));
 
-  // Build targeted search combinations
+  // Build targeted search combinations (Highest priority first)
   const searchQueries = [];
 
-  // Hebrew-first query if Hebrew text exists in title
   if (hebrewParts.length > 0) {
     searchQueries.push(`${mainArtist} ${hebrewParts.join(' ')}`);
-    searchQueries.push(`${hebrewParts.join(' ')}`);
+    searchQueries.push(`${artistLastName} ${hebrewParts.join(' ')}`); // Last name fallback
   }
 
-  // English/Transliterated query
   if (englishParts.length > 0) {
     searchQueries.push(`${mainArtist} ${englishParts.join(' ')}`);
+    searchQueries.push(`${artistLastName} ${englishParts.join(' ')}`);
   }
 
-  // Combined fallback query
   searchQueries.push(`${mainArtist} ${cleanedTitle}`);
+  searchQueries.push(`${artistLastName} ${cleanedTitle}`);
 
   const uniqueQueries = [...new Set(searchQueries)];
+
+  // Text Cleaner: Removes [Chorus], [Verse], and weird HTML artifacts
+  function cleanLyricsText(rawText) {
+    return rawText
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, '') // Strip remaining HTML
+      .replace(/&#x27;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/\[.*?\]/g, '') // Remove [Chorus], [Verse 1], etc.
+      .replace(/\n{3,}/g, '\n\n') // Fix massive gaps
+      .trim();
+  }
 
   // Helper 1: Search LRCLIB Fuzzy
   async function searchLrclib(q) {
@@ -48,27 +66,30 @@ export default async function handler(req, res) {
       if (Array.isArray(data) && data.length > 0) {
         return data[0].syncedLyrics || data[0].plainLyrics || null;
       }
-    } catch (e) {
-      return null;
-    }
+    } catch (e) { return null; }
     return null;
   }
 
-  // Helper 2: Direct Genius Search
+  // Helper 2: Direct Genius Search (With Romanization Blocker)
   async function searchGenius(q) {
     try {
       const res = await fetch(
         `https://genius.com/api/search/multi?q=${encodeURIComponent(q)}`,
-        { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
       );
       if (!res.ok) return null;
       const data = await res.json();
       const hits = data?.response?.sections?.find(s => s.type === 'song')?.hits || [];
-      if (hits.length === 0) return null;
+      
+      // Find the first hit that IS NOT a translation or romanized version
+      const bestHit = hits.find(h => 
+        !h.result.url.includes('-romanized-') && 
+        !h.result.url.includes('-english-translation-')
+      );
 
-      const pageRes = await fetch(hits[0].result.url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-      });
+      if (!bestHit) return null;
+
+      const pageRes = await fetch(bestHit.result.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       const html = await pageRes.text();
 
       const containerRegex = /<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
@@ -79,33 +100,26 @@ export default async function handler(req, res) {
       }
       if (matches.length === 0) return null;
 
-      return matches.join('\n')
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&#x27;/g, "'")
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
-        .trim();
-    } catch (e) {
-      return null;
-    }
+      return cleanLyricsText(matches.join('\n'));
+    } catch (e) { return null; }
   }
 
-  // Helper 3: Search Web Fallback (DuckDuckGo Search with "מילים")
+  // Helper 3: Web Fallback (DuckDuckGo Search with "מילים" and Romanization Blocker)
   async function searchWebFallback(artistName, songName) {
     try {
       const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} מילים genius`)}`;
-      const res = await fetch(searchUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-      });
+      const res = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       const html = await res.text();
 
-      // Find first Genius link in search results
-      const geniusUrlMatch = html.match(/https?:\/\/(?:[a-z]+\.)?genius\.com\/[^"&]+/i);
-      if (geniusUrlMatch) {
-        const pageRes = await fetch(geniusUrlMatch[0], {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        });
+      // Find Genius links, reject translation/romanized links
+      const allLinks = html.match(/https?:\/\/(?:[a-z]+\.)?genius\.com\/[^"&]+/gi) || [];
+      const validLink = allLinks.find(link => 
+        !link.includes('-romanized-') && 
+        !link.includes('-english-translation-')
+      );
+
+      if (validLink) {
+        const pageRes = await fetch(validLink, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         const pageHtml = await pageRes.text();
         const containerRegex = /<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
         let matches = [];
@@ -113,32 +127,22 @@ export default async function handler(req, res) {
         while ((match = containerRegex.exec(pageHtml)) !== null) {
           matches.push(match[1]);
         }
-        if (matches.length > 0) {
-          return matches.join('\n')
-            .replace(/<br\s*\/?>/gi, '\n')
-            .replace(/<[^>]+>/g, '')
-            .replace(/&#x27;/g, "'")
-            .replace(/&quot;/g, '"')
-            .replace(/&amp;/g, '&')
-            .trim();
-        }
+        if (matches.length > 0) return cleanLyricsText(matches.join('\n'));
       }
-    } catch (e) {
-      return null;
-    }
+    } catch (e) { return null; }
     return null;
   }
 
-  // Process queries sequentially across providers
+  // 4. Execution: Process queries sequentially
   for (const query of uniqueQueries) {
     const lrclibResult = await searchLrclib(query);
-    if (lrclibResult) return res.status(200).json({ lyrics: lrclibResult, source: 'lrclib' });
+    if (lrclibResult) return res.status(200).json({ lyrics: cleanLyricsText(lrclibResult), source: 'lrclib' });
 
     const geniusResult = await searchGenius(query);
     if (geniusResult) return res.status(200).json({ lyrics: geniusResult, source: 'genius' });
   }
 
-  // Final fallback: Web Search with Hebrew search keyword "מילים"
+  // Final fallback: Web Search
   const webResult = await searchWebFallback(mainArtist, cleanedTitle);
   if (webResult) {
     return res.status(200).json({ lyrics: webResult, source: 'web-fallback' });
