@@ -6,10 +6,8 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing artist or title' });
   }
 
-  // Vercel Edge Caching (Instant load for 24 hours)
   res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=43200');
 
-  // Rotate User-Agents to prevent scraper blocks
   const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
@@ -21,7 +19,6 @@ export default async function handler(req, res) {
     return str.replace(/[\u0591-\u05C7]/g, '');
   }
 
-  // Ghost Translator for Transliterated Titles
   async function getHebrewTranslation(text) {
     try {
       const res = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=iw&dt=t&q=${encodeURIComponent(text)}`);
@@ -30,11 +27,9 @@ export default async function handler(req, res) {
     } catch (e) { return null; }
   }
 
-  // 1. Unpack Artists
   const artistList = artist.split(/;|,/).map(a => a.trim()).filter(Boolean);
   const primaryArtist = artistList[0];
 
-  // 2. Clean Title
   const cleanedTitle = stripNikud(rawTitle)
     .replace(/\(live.*?\)/gi, '')
     .replace(/\(acoustic.*?\)/gi, '')
@@ -46,29 +41,39 @@ export default async function handler(req, res) {
     .replace(/["'״]/g, '')
     .trim();
 
-  // 3. Handle Dual-Language Titles (e.g., "Shabbat Gan Eden - שבת גן עדן")
   const titleVariants = cleanedTitle.split(/[-/]/).map(t => t.trim()).filter(Boolean);
   if (!titleVariants.includes(cleanedTitle)) {
     titleVariants.push(cleanedTitle);
   }
 
-  // Build Comprehensive Query Queue
   const searchQueries = [];
+
   for (const tVariant of titleVariants) {
     for (const a of artistList) {
       searchQueries.push(`${a} ${tVariant}`);
     }
   }
 
-  // Check if Hebrew translation is needed
-  const hasHebrew = /[\u0590-\u05FF]/.test(cleanedTitle);
-  if (!hasHebrew) {
-    const translatedTitle = await getHebrewTranslation(cleanedTitle);
-    if (translatedTitle) {
-      for (const a of artistList) {
-        searchQueries.push(`${a} ${translatedTitle}`);
-      }
-    }
+  // Independently verify and translate artist and title to Hebrew
+  const isArtistHebrew = /[\u0590-\u05FF]/.test(primaryArtist);
+  const isTitleHebrew = /[\u0590-\u05FF]/.test(cleanedTitle);
+
+  let translatedArtist = primaryArtist;
+  if (!isArtistHebrew) {
+    const translated = await getHebrewTranslation(primaryArtist);
+    if (translated) translatedArtist = translated;
+  }
+
+  let translatedTitle = cleanedTitle;
+  if (!isTitleHebrew) {
+    const translated = await getHebrewTranslation(cleanedTitle);
+    if (translated) translatedTitle = translated;
+  }
+
+  // Push fully translated search terms (e.g., "עקיבא כלום מלבדך")
+  if (translatedArtist !== primaryArtist || translatedTitle !== cleanedTitle) {
+    searchQueries.push(`${translatedArtist} ${translatedTitle}`);
+    searchQueries.push(`${translatedArtist} ${cleanedTitle}`);
   }
 
   const uniqueQueries = [...new Set(searchQueries)];
@@ -131,16 +136,28 @@ export default async function handler(req, res) {
     } catch (e) { return null; }
   }
 
+  // Web Fallback with DuckDuckGo URL Unwrapping
   async function searchWebFallback(artistName, songName) {
     try {
-      // Shironet Scraper
-      const shironetSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} site:shironet.mako.co.il`)}`;
+      const queryStr = `${artistName} ${songName} site:shironet.mako.co.il`;
+      const shironetSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(queryStr)}`;
       const shironetRes = await fetch(shironetSearch, { headers: { 'User-Agent': randomUserAgent } });
       const shironetHtml = await shironetRes.text();
-      const shironetLink = shironetHtml.match(/https?:\/\/shironet\.mako\.co\.il\/artist\?type=lyrics[^"&]+/i);
 
-      if (shironetLink) {
-        const pageRes = await fetch(shironetLink[0], { headers: { 'User-Agent': randomUserAgent } });
+      // Decode DuckDuckGo redirect parameters (uddg=)
+      const uddgMatches = shironetHtml.match(/uddg=([^&"#]+)/g) || [];
+      let targetShironetUrl = null;
+
+      for (const rawMatch of uddgMatches) {
+        const decoded = decodeURIComponent(rawMatch.replace('uddg=', ''));
+        if (decoded.includes('shironet.mako.co.il/artist?type=lyrics')) {
+          targetShironetUrl = decoded;
+          break;
+        }
+      }
+
+      if (targetShironetUrl) {
+        const pageRes = await fetch(targetShironetUrl, { headers: { 'User-Agent': randomUserAgent } });
         const pageHtml = await pageRes.text();
         const lyricMatch = pageHtml.match(/<span itemprop="Lyrics" class="artist_lyrics_text">([\s\S]*?)<\/span>/i);
         if (lyricMatch) {
@@ -149,14 +166,24 @@ export default async function handler(req, res) {
         }
       }
 
-      // Genius Web Fallback
+      // Genius Web Fallback with URL unwrapping
       const geniusSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} מילים genius`)}`;
       const geniusRes = await fetch(geniusSearch, { headers: { 'User-Agent': randomUserAgent } });
       const html = await geniusRes.text();
-      const validLink = (html.match(/https?:\/\/(?:[a-z]+\.)?genius\.com\/[^"&]+/gi) || []).find(link => !link.includes('-romanized-') && !link.includes('-english-translation-'));
+      
+      const geniusUddgMatches = html.match(/uddg=([^&"#]+)/g) || [];
+      let targetGeniusUrl = null;
 
-      if (validLink) {
-        const pageRes = await fetch(validLink, { headers: { 'User-Agent': randomUserAgent } });
+      for (const rawMatch of geniusUddgMatches) {
+        const decoded = decodeURIComponent(rawMatch.replace('uddg=', ''));
+        if (decoded.includes('genius.com/') && !decoded.includes('-romanized-') && !decoded.includes('-english-translation-')) {
+          targetGeniusUrl = decoded;
+          break;
+        }
+      }
+
+      if (targetGeniusUrl) {
+        const pageRes = await fetch(targetGeniusUrl, { headers: { 'User-Agent': randomUserAgent } });
         const pageHtml = await pageRes.text();
         const containerRegex = /<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
         let matches = [];
@@ -169,7 +196,6 @@ export default async function handler(req, res) {
     return null;
   }
 
-  // Execution Loop
   for (const query of uniqueQueries) {
     const lrclibResult = await searchLrclib(query);
     if (lrclibResult && isValidLyrics(lrclibResult.text)) {
@@ -180,7 +206,7 @@ export default async function handler(req, res) {
     if (geniusResult) return res.status(200).json({ lyrics: geniusResult, source: 'genius', synced: false });
   }
 
-  const webResult = await searchWebFallback(primaryArtist, titleVariants[0]);
+  const webResult = await searchWebFallback(translatedArtist || primaryArtist, translatedTitle || titleVariants[0]);
   if (webResult) {
     return res.status(200).json({ lyrics: webResult, source: 'web-scraper', synced: false });
   }
