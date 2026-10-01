@@ -6,14 +6,35 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing artist or title' });
   }
 
+  // Vercel Edge Caching (Instant load for 24 hours)
   res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=43200');
+
+  // Rotate User-Agents to prevent scraper blocks
+  const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+  ];
+  const randomUserAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
   function stripNikud(str) {
     return str.replace(/[\u0591-\u05C7]/g, '');
   }
 
-  const mainArtist = artist.split(';')[0].split(',')[0].trim();
-  
+  // Ghost Translator for Transliterated Titles
+  async function getHebrewTranslation(text) {
+    try {
+      const res = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=iw&dt=t&q=${encodeURIComponent(text)}`);
+      const data = await res.json();
+      return data[0].map(item => item[0]).join('');
+    } catch (e) { return null; }
+  }
+
+  // 1. Unpack Artists
+  const artistList = artist.split(/;|,/).map(a => a.trim()).filter(Boolean);
+  const primaryArtist = artistList[0];
+
+  // 2. Clean Title
   const cleanedTitle = stripNikud(rawTitle)
     .replace(/\(live.*?\)/gi, '')
     .replace(/\(acoustic.*?\)/gi, '')
@@ -25,27 +46,29 @@ export default async function handler(req, res) {
     .replace(/["'״]/g, '')
     .trim();
 
-  const hebrewRegex = /[\u0590-\u05FF]/;
-  const hasHebrew = hebrewRegex.test(cleanedTitle) || hebrewRegex.test(mainArtist);
-
-  // GHOST TRANSLATOR: Auto-converts English/Romanized to Hebrew script via Google Translate API
-  async function getHebrewTranslation(text) {
-    try {
-      const res = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=iw&dt=t&q=${encodeURIComponent(text)}`);
-      const data = await res.json();
-      return data[0].map(item => item[0]).join('');
-    } catch (e) { return null; }
+  // 3. Handle Dual-Language Titles (e.g., "Shabbat Gan Eden - שבת גן עדן")
+  const titleVariants = cleanedTitle.split(/[-/]/).map(t => t.trim()).filter(Boolean);
+  if (!titleVariants.includes(cleanedTitle)) {
+    titleVariants.push(cleanedTitle);
   }
 
+  // Build Comprehensive Query Queue
   const searchQueries = [];
-  searchQueries.push(`${mainArtist} ${cleanedTitle}`);
+  for (const tVariant of titleVariants) {
+    for (const a of artistList) {
+      searchQueries.push(`${a} ${tVariant}`);
+    }
+  }
 
-  // If there is no Hebrew in the title, generate it automatically
+  // Check if Hebrew translation is needed
+  const hasHebrew = /[\u0590-\u05FF]/.test(cleanedTitle);
   if (!hasHebrew) {
     const translatedTitle = await getHebrewTranslation(cleanedTitle);
-    const translatedArtist = await getHebrewTranslation(mainArtist);
-    if (translatedTitle) searchQueries.push(`${mainArtist} ${translatedTitle}`);
-    if (translatedArtist && translatedTitle) searchQueries.push(`${translatedArtist} ${translatedTitle}`);
+    if (translatedTitle) {
+      for (const a of artistList) {
+        searchQueries.push(`${a} ${translatedTitle}`);
+      }
+    }
   }
 
   const uniqueQueries = [...new Set(searchQueries)];
@@ -64,13 +87,11 @@ export default async function handler(req, res) {
       .trim();
   }
 
-  // GARBAGE FILTER: Detects if Genius handed us a band biography or tracklist (Fixes Zusha)
   function isValidLyrics(text) {
     if (!text) return false;
     const lower = text.toLowerCase();
     if (lower.includes('tracklist') || lower.includes('album credits') || lower.includes('q&a')) return false;
-    // Reject if it's a massive block of text with no line breaks (like a bio)
-    if (text.length > 250 && !text.includes('\n')) return false;
+    if (text.length > 300 && !text.includes('\n')) return false;
     return true;
   }
 
@@ -90,13 +111,15 @@ export default async function handler(req, res) {
 
   async function searchGenius(q) {
     try {
-      const res = await fetch(`https://genius.com/api/search/multi?q=${encodeURIComponent(q)}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const res = await fetch(`https://genius.com/api/search/multi?q=${encodeURIComponent(q)}`, { 
+        headers: { 'User-Agent': randomUserAgent } 
+      });
       const data = await res.json();
       const hits = data?.response?.sections?.find(s => s.type === 'song')?.hits || [];
       const bestHit = hits.find(h => !h.result.url.includes('-romanized-') && !h.result.url.includes('-english-translation-'));
       if (!bestHit) return null;
 
-      const pageRes = await fetch(bestHit.result.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const pageRes = await fetch(bestHit.result.url, { headers: { 'User-Agent': randomUserAgent } });
       const html = await pageRes.text();
       const containerRegex = /<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
       let matches = [];
@@ -108,17 +131,16 @@ export default async function handler(req, res) {
     } catch (e) { return null; }
   }
 
-  // MEGA-SCRAPER: Uses DuckDuckGo to hunt for Shironet and Genius
   async function searchWebFallback(artistName, songName) {
     try {
-      // 1. Try to find the Israeli site Shironet first
+      // Shironet Scraper
       const shironetSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} site:shironet.mako.co.il`)}`;
-      const shironetRes = await fetch(shironetSearch, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const shironetRes = await fetch(shironetSearch, { headers: { 'User-Agent': randomUserAgent } });
       const shironetHtml = await shironetRes.text();
       const shironetLink = shironetHtml.match(/https?:\/\/shironet\.mako\.co\.il\/artist\?type=lyrics[^"&]+/i);
 
       if (shironetLink) {
-        const pageRes = await fetch(shironetLink[0], { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const pageRes = await fetch(shironetLink[0], { headers: { 'User-Agent': randomUserAgent } });
         const pageHtml = await pageRes.text();
         const lyricMatch = pageHtml.match(/<span itemprop="Lyrics" class="artist_lyrics_text">([\s\S]*?)<\/span>/i);
         if (lyricMatch) {
@@ -127,14 +149,14 @@ export default async function handler(req, res) {
         }
       }
 
-      // 2. Fallback to Genius web search
+      // Genius Web Fallback
       const geniusSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} מילים genius`)}`;
-      const geniusRes = await fetch(geniusSearch, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const geniusRes = await fetch(geniusSearch, { headers: { 'User-Agent': randomUserAgent } });
       const html = await geniusRes.text();
       const validLink = (html.match(/https?:\/\/(?:[a-z]+\.)?genius\.com\/[^"&]+/gi) || []).find(link => !link.includes('-romanized-') && !link.includes('-english-translation-'));
 
       if (validLink) {
-        const pageRes = await fetch(validLink, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const pageRes = await fetch(validLink, { headers: { 'User-Agent': randomUserAgent } });
         const pageHtml = await pageRes.text();
         const containerRegex = /<div[^>]*data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
         let matches = [];
@@ -147,7 +169,7 @@ export default async function handler(req, res) {
     return null;
   }
 
-  // Execution: Process everything
+  // Execution Loop
   for (const query of uniqueQueries) {
     const lrclibResult = await searchLrclib(query);
     if (lrclibResult && isValidLyrics(lrclibResult.text)) {
@@ -158,8 +180,7 @@ export default async function handler(req, res) {
     if (geniusResult) return res.status(200).json({ lyrics: geniusResult, source: 'genius', synced: false });
   }
 
-  // Final Mega-Scraper Fallback
-  const webResult = await searchWebFallback(mainArtist, cleanedTitle);
+  const webResult = await searchWebFallback(primaryArtist, titleVariants[0]);
   if (webResult) {
     return res.status(200).json({ lyrics: webResult, source: 'web-scraper', synced: false });
   }
