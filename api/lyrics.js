@@ -54,7 +54,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Independently verify and translate artist and title to Hebrew
   const isArtistHebrew = /[\u0590-\u05FF]/.test(primaryArtist);
   const isTitleHebrew = /[\u0590-\u05FF]/.test(cleanedTitle);
 
@@ -70,7 +69,6 @@ export default async function handler(req, res) {
     if (translated) translatedTitle = translated;
   }
 
-  // Push fully translated search terms (e.g., "עקיבא כלום מלבדך")
   if (translatedArtist !== primaryArtist || translatedTitle !== cleanedTitle) {
     searchQueries.push(`${translatedArtist} ${translatedTitle}`);
     searchQueries.push(`${translatedArtist} ${cleanedTitle}`);
@@ -136,7 +134,6 @@ export default async function handler(req, res) {
     } catch (e) { return null; }
   }
 
-  // Web Fallback with DuckDuckGo URL Unwrapping
   async function searchWebFallback(artistName, songName) {
     try {
       const queryStr = `${artistName} ${songName} site:shironet.mako.co.il`;
@@ -144,7 +141,6 @@ export default async function handler(req, res) {
       const shironetRes = await fetch(shironetSearch, { headers: { 'User-Agent': randomUserAgent } });
       const shironetHtml = await shironetRes.text();
 
-      // Decode DuckDuckGo redirect parameters (uddg=)
       const uddgMatches = shironetHtml.match(/uddg=([^&"#]+)/g) || [];
       let targetShironetUrl = null;
 
@@ -159,14 +155,18 @@ export default async function handler(req, res) {
       if (targetShironetUrl) {
         const pageRes = await fetch(targetShironetUrl, { headers: { 'User-Agent': randomUserAgent } });
         const pageHtml = await pageRes.text();
-        const lyricMatch = pageHtml.match(/<span itemprop="Lyrics" class="artist_lyrics_text">([\s\S]*?)<\/span>/i);
+        
+        // AGGRESSIVE SHIRONET SCRAPING: Look for multiple possible container classes
+        const lyricMatch = pageHtml.match(/<span itemprop="Lyrics" class="artist_lyrics_text">([\s\S]*?)<\/span>/i) ||
+                           pageHtml.match(/<span class="artist_lyrics_text">([\s\S]*?)<\/span>/i) ||
+                           pageHtml.match(/<div class="lyrics">([\s\S]*?)<\/div>/i);
+                           
         if (lyricMatch) {
           const cleanShironet = cleanLyricsText(lyricMatch[1]);
           if (isValidLyrics(cleanShironet)) return cleanShironet;
         }
       }
 
-      // Genius Web Fallback with URL unwrapping
       const geniusSearch = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`${artistName}${songName} מילים genius`)}`;
       const geniusRes = await fetch(geniusSearch, { headers: { 'User-Agent': randomUserAgent } });
       const html = await geniusRes.text();
